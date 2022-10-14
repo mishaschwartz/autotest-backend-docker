@@ -1,15 +1,19 @@
+import gzip
+import mimetypes
 import os
 import io
 import json
+import signal
+import tarfile
 import time
-import glob
+import subprocess
 
 import docker
 import redis
 
 import concurrent.futures
 from contextlib import contextmanager
-from typing import Optional, Dict
+from typing import Optional, Dict, Type, Tuple, List
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _REGISTRY_HOST = os.path.join(_, "/") if (_ := os.environ.get("REGISTRY_HOST")) else ""
@@ -58,7 +62,7 @@ def full_image_tag(local_tag):
     return f"{_REGISTRY_HOST}{local_tag}"
 
 
-def _find_or_create_image(docker_client, image_name, dockerfile):
+def _find_or_create_image(docker_client, image_name, path=_THIS_DIR, **kwargs):
     tag = full_image_tag(image_name)
     try:
         return docker_client.images.get(tag)
@@ -69,18 +73,22 @@ def _find_or_create_image(docker_client, image_name, dockerfile):
             return docker_client.images.pull(tag)
         except docker.errors.NotFound:
             pass
-    image = docker_client.images.build(path=_THIS_DIR, dockerfile=dockerfile, tag=tag, rm=True)
+    image = docker_client.images.build(path=path, tag=tag, rm=True, **kwargs)
     if _REGISTRY_HOST:
         docker_client.images.push(tag)
     return image
 
 
 def file_download_image(docker_client):
-    return _find_or_create_image(docker_client, _DOWNLOAD_IMAGE_NAME, "file_download.Dockerfile")
+    return _find_or_create_image(docker_client, _DOWNLOAD_IMAGE_NAME, dockerfile="file_download.Dockerfile")
 
 
 def entrypoint_image(docker_client):
-    return _find_or_create_image(docker_client, _ENTRYPOINT_IMAGE_NAME, "entrypoint.Dockerfile")
+    return _find_or_create_image(docker_client, _ENTRYPOINT_IMAGE_NAME, dockerfile="entrypoint.Dockerfile")
+
+
+def plugin_image(docker_client, name, path):
+    return _find_or_create_image(docker_client, name, path=path)
 
 
 def download_files_to_volume(docker_client, file_url, credentials, volume_name):
@@ -108,10 +116,10 @@ def tmp_volume(
     docker_client,
     *args,
     driver=os.environ.get("VOLUME_DRIVER", "local"),
-    driver_opts=json.loads(os.environ.get("VOLUME_DRIVER_OPTS").strip() or "{}"),
+    driver_opts=json.loads(os.environ.get("VOLUME_DRIVER_OPTS", "").strip() or "{}"),
     **kwargs,
 ):
-    volume = docker_client.volume.create(*args, driver=driver, driver_opts=driver_opts, **kwargs)
+    volume = docker_client.volumes.create(*args, driver=driver, driver_opts=driver_opts, **kwargs)
     try:
         yield volume
     finally:
@@ -135,7 +143,7 @@ def get_feedback(container, test_data, test_id):
         conn = redis_connection()
         id_ = conn.incr("autotest:feedback_files_id")
         key = f"autotest:feedback_file:{test_id}:{id_}"
-        with tarfile.open(fileobj=BytesIO(b"".join(file_data))) as tf:
+        with tarfile.open(fileobj=io.BytesIO(b"".join(file_data))) as tf:
             member = tf.extractfile(abs_path)
             if member:
                 conn.set(key, gzip.compress(member.read()))
@@ -144,8 +152,8 @@ def get_feedback(container, test_data, test_id):
                 raise Exception(f"Feedback file at '{file_path}' is not a regular file.")
         feedback.append(
             {
-                "filename": feedback_file,
-                "mime_type": mimetypes.guess_type(feedback_path)[0] or "text/plain",
+                "filename": os.path.basename(file_path),
+                "mime_type": mimetypes.guess_type(file_path)[0] or "text/plain",
                 "compression": "gzip",
                 "id": id_,
             }
@@ -153,7 +161,7 @@ def get_feedback(container, test_data, test_id):
     return feedback
 
 
-def get_result(container, test_data, test_id):
+def get_result(container, test_data, test_id, dateutil=None):
     stdout = container.logs(stderr=False, stdout=True)
     stderr = container.logs(stderr=True, stdout=False).strip()
     all_results, malformed = loads_partial_json(stdout, dict)
@@ -172,7 +180,7 @@ def get_result(container, test_data, test_id):
         "annotations": None,
         "feedback": get_feedback(container, test_data, test_id),
     }
-    if run_time >= timeout:
+    if run_time >= test_data["timeout"]:
         result["timeout"] = test_data["timeout"]
     for res in all_results:
         if "annotations" in res:
@@ -183,22 +191,60 @@ def get_result(container, test_data, test_id):
     return result
 
 
-def exec_test(test_data, image_name, id_suffix, script_volume_name, files_volume_name, test_env_vars):
+def create_plugin_containers(docker_client, plugin_data, network, id_suffix):
+    environment = {}
+    plugin_containers = []
+    for name, data in plugin_data.items():
+        if data.get("enabled"):
+            path = redis_connection().get(f"autotest:plugin:{name}")
+            if path is None:
+                raise Exception(f"plugin {name} is not installed")
+            cli = os.path.join(path, "docker.cli")
+            stringified_data = {k: str(v) for k, v in data.items() if k != "enabled"}
+            proc = subprocess.run(
+                [cli, "before_test"], capture_output=True, check=False, universal_newlines=True, env=stringified_data
+            )
+            environment.update(json.loads(proc.stdout))
+            plugin_image_tag = plugin_image(docker_client, name, path).tags[0]
+            plugin_containers.append(
+                docker_client.containers.run(
+                    plugin_image_tag, name=f"autotest-container-test-{name}-{id_suffix}", detach=True, network=network
+                )
+            )
+    return plugin_containers, environment
+
+
+def exec_test(
+    test_data,
+    image_name,
+    id_suffix,
+    script_volume_name,
+    files_volume_name,
+    test_env_vars,
+    plugin_data,
+    volume_data,
+    docker_client,
+):
     container_name = f"autotest-container-test-{id_suffix}"
     with tmp_network(docker_client, f"autotest-network-{id_suffix}") as network:
+        plugin_containers, plugin_environment = create_plugin_containers(docker_client, plugin_data, network, id_suffix)
+        environment = {"AUTOTESTENV": "true", **test_env_vars, **plugin_environment}
+        data_volumes = [f"{name}:/data/{name}:ro" for name in volume_data]
+        volumes = [f"{script_volume_name}:/tmp/scripts:ro", f"{files_volume_name}:/tmp/files:ro", *data_volumes]
         container = docker_client.containers.run(
             image_name,
             detach=True,
             network=network,
-            environment=test_env_vars,
+            environment=environment,
             name=container_name,
             stop_signal=signal.SIGUSR1,
-            volumes=[f"{script_volume_name}:/tmp/scripts:ro", f"{files_volume_name}:/tmp/files:ro"],
+            volumes=volumes,
             command=json.dumps(test_data),
-            entrypoint=["/entrypoint.sh"]
+            entrypoint=["/entrypoint.sh"],
         )
+
         container.stop(timeout=test_data["timeout"])
-    return (container,)  # TODO: add postgres, mongodb, etc. supporting containers to the network
+    return container, *plugin_containers
 
 
 def run_test(settings_id, test_id, files_url, categories, user, test_env_vars):
@@ -212,7 +258,7 @@ def run_test(settings_id, test_id, files_url, categories, user, test_env_vars):
         docker_client = docker.from_env()
         creds = json.loads(redis_connection().hget("autotest:user_credentials", key=user))
         files_volume_name = f"autotest-files-{settings_id}-{test_id}"
-        with tmp_volume(name=files_volume_name):
+        with tmp_volume(docker_client, name=files_volume_name):
             download_files_to_volume(docker_client, files_url, creds, files_volume_name)
 
             script_volume_name = settings["_scripts_volume"]
@@ -221,9 +267,11 @@ def run_test(settings_id, test_id, files_url, categories, user, test_env_vars):
             try:
                 with concurrent.futures.ThreadPoolExecutor() as executor:
                     futures = {}
-                    for i, tester_settings in enumerate(test_settings["testers"]):
+                    for i, tester_settings in enumerate(settings["testers"]):
                         for j, test_data in enumerate(tester_settings["test_data"]):
-                            if set(test_category) & set(categories):
+                            plugin_data = test_data.get("plugins", {})
+                            volume_data = test_data.get("data_volumes", [])
+                            if set(test_data["category"]) & set(categories):
                                 id_suffix = f"{settings_id}-{test_id}-{i}-{j}"
                                 container_suffixes.append(id_suffix)
                                 image_name = tester_settings["_image"]
@@ -235,12 +283,17 @@ def run_test(settings_id, test_id, files_url, categories, user, test_env_vars):
                                     script_volume_name,
                                     files_volume_name,
                                     test_env_vars,
+                                    plugin_data,
+                                    volume_data,
+                                    docker_client,
                                 )
                                 futures[future] = (test_data, id_suffix)
-                    for future in concurrent.futures.as_compoleted(futures):
-                        tester_container, *_supporting_containers = future.result()
+                    for future in concurrent.futures.as_completed(futures):
+                        tester_container, *supporting_containers = future.result()
                         test_data, id_suffix = futures[future]
                         results.append(get_result(tester_container, test_data, test_id))
+                        for container in supporting_containers:
+                            container.kill()
             finally:
                 remove_all_containers(docker_client, container_suffixes, force=True)
     except Exception as e:
@@ -259,11 +312,10 @@ def update_test_settings(user, settings_id, test_settings, file_url):
         script_volume_name = f"autotest-files-{settings_id}"
         try:
             old_volume = docker_client.volumes.get(script_volume_name)
-            # docker_client.containers.list(filters={'volume': script_volume_name))  # TODO: don't remove if in use
-            old_volume.remove(force=True)
+            old_volume.remove(force=True)  # TODO: don't remove if in use
         except docker.errors.NotFound:
             pass
-        docker_client.volumes.create(name=volume_name)
+        docker_client.volumes.create(name=script_volume_name)
         download_files_to_volume(docker_client, file_url, creds, script_volume_name)
         test_settings["_scripts_volume"] = script_volume_name
 
@@ -273,9 +325,11 @@ def update_test_settings(user, settings_id, test_settings, file_url):
             tester_type = tester_settings["tester_type"]
             env_data = tester_settings.get("env_data", {})
             tag = full_image_tag(f"tester:{settings_id}.{i}")
-            with open(os.path.join(_TESTERS_DIR, tester_type, 'Dockerfile')) as f:
+            with open(os.path.join(_TESTERS_DIR, tester_type, "Dockerfile")) as f:
                 dockerfile_buffer = io.StringIO()
-                dockerfile_buffer.write(f"{f.read()}\nCOPY --from={entrypoint_tag} --chmod=0744 /entrypoint.sh /entrypoint.sh\n")
+                dockerfile_buffer.write(
+                    f"{f.read()}\nCOPY --from={entrypoint_tag} --chmod=0744 /entrypoint.sh /entrypoint.sh\n"
+                )
                 tester_image, _ = docker_client.images.build(
                     path=os.path.join(_TESTERS_DIR, tester_type),
                     fileobj=dockerfile_buffer,

@@ -3,9 +3,8 @@ version: '3.7'
 services:
   server:
     build:
-      context: ./server
       target: dev
-    image: autotest-server-dev:1.1.0
+    image: autotest-backend-docker-dev:1.0.0
     volumes:
       - .:/app
       - /var/run/docker.sock:/var/run/docker.sock
