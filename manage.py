@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 
+"""
+CLI to install the backend and manage plugins and data entries
+"""
+
 import sys
 import os
 import json
@@ -7,20 +11,30 @@ import subprocess
 import argparse
 import docker
 from autotest_backend import redis_connection, plugin_image
+from typing import Dict, Callable, Sequence, Iterable, Tuple
+from docker import errors as docker_errors
 
-SKELETON_FILE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "schema_skeleton.json")
 
-
-def _schema_skeleton():
-    with open(SKELETON_FILE) as f:
+def _schema_skeleton() -> Dict:
+    """
+    Return a dictionary representation of the json loaded from the schema_skeleton.json file
+    """
+    with open(os.path.join(os.path.dirname(os.path.realpath(__file__)), "schema_skeleton.json")) as f:
         return json.load(f)
 
 
-def _print(*args_, **kwargs):
+def _print(*args_, **kwargs) -> None:
+    """
+    Exactly the same as the builtin print function but prepends "[AUTOTESTER]"
+    """
     print("[AUTOTESTER]", *args_, **kwargs)
 
 
-def parse_args():
+def parse_args() -> Callable:
+    """
+    Parses command line arguments using the argparse module and returns a function to call to
+    execute the requested command.
+    """
     parser = argparse.ArgumentParser()
 
     subparsers = parser.add_subparsers(dest="manager")
@@ -55,14 +69,29 @@ def parse_args():
     if args.manager == "install":
         args.action = "install"
 
-    return managers[args.manager], args
+    return getattr(managers[args.manager](args), args.action)
 
 
-class PluginManager:
+class _Manager:
+    """
+    Abstract Manager class used to manage resources
+    """
+
+    args: argparse.Namespace
+
     def __init__(self, args):
         self.args = args
 
-    def install(self):
+
+class PluginManager(_Manager):
+    """
+    Manger for plugins
+    """
+
+    def install(self) -> None:
+        """
+        Install a plugin
+        """
         skeleton = _schema_skeleton()
         docker_client = docker.from_env()
         for path in self.args.paths:
@@ -87,7 +116,10 @@ class PluginManager:
                 redis_connection().set(f"autotest:plugin:{plugin_name}", path)
         redis_connection().set("autotest:schema", json.dumps(skeleton))
 
-    def remove(self, additional=tuple()):
+    def remove(self, additional: Sequence = tuple()) -> None:
+        """
+        Remove a plugin
+        """
         skeleton = _schema_skeleton()
 
         installed_plugins = skeleton["definitions"]["plugins"]["properties"]
@@ -102,27 +134,40 @@ class PluginManager:
         redis_connection().set("autotest:schema", json.dumps(skeleton))
 
     @staticmethod
-    def _get_installed():
+    def _get_installed() -> Iterable[Tuple[str, str]]:
+        """
+        Yield the name and path of all installed plugins
+        """
         for plugin_key in redis_connection().keys("autotest:tuple:*"):
             plugin_name = plugin_key.split(":")[-1]
             path = redis_connection().get(plugin_key)
             yield plugin_name, path
 
-    def list(self):
+    def list(self) -> None:
+        """
+        Print the name and path of all installed plugins
+        """
         for plugin_name, path in self._get_installed():
             print(f"{plugin_name} @ {path}")
 
-    def clean(self):
+    def clean(self) -> None:
+        """
+        Remove all plugins that are installed but whose data has been removed from disk
+        """
         to_remove = [plugin_name for plugin_name, path in self._get_installed() if not os.path.isdir(path)]
         _print("Removing the following testers:", *to_remove, sep="\t\n")
         self.remove(additional=to_remove)
 
 
-class TesterManager:
-    def __init__(self, args):
-        self.args = args
+class TesterManager(_Manager):
+    """
+    Manager for testers
+    """
 
-    def install(self):
+    def install(self) -> None:
+        """
+        Install testers
+        """
         skeleton = _schema_skeleton()
         for path in self.args.paths:
             cli = os.path.join(path, "docker.cli")
@@ -146,7 +191,11 @@ class TesterManager:
                 redis_connection().set(f"autotest:tester:{tester_name}", path)
         redis_connection().set("autotest:schema", json.dumps(skeleton))
 
-    def remove(self, additional=tuple()):
+    def remove(self, additional: Sequence = tuple()) -> None:
+        """
+        Removes installed testers specified in self.args. Additional testers to remove can be specified
+        with the additional keyword
+        """
         skeleton = _schema_skeleton()
 
         tester_settings = skeleton["definitions"]["tester_schemas"]["oneOf"]
@@ -162,27 +211,40 @@ class TesterManager:
         redis_connection().set("autotest:schema", json.dumps(skeleton))
 
     @staticmethod
-    def _get_installed():
+    def _get_installed() -> Iterable[Tuple[str, str]]:
+        """
+        Yield the name and path of all installed testers
+        """
         for tester_key in redis_connection().keys("autotest:tester:*"):
             tester_name = tester_key.split(":")[-1]
             path = redis_connection().get(tester_key)
             yield tester_name, path
 
-    def list(self):
+    def list(self) -> None:
+        """
+        Print the name and path of all installed testers
+        """
         for tester_name, path in self._get_installed():
             print(f"{tester_name} @ {path}")
 
-    def clean(self):
+    def clean(self) -> None:
+        """
+        Remove all testers that are installed but whose data has been removed from disk
+        """
         to_remove = [tester_name for tester_name, path in self._get_installed() if not os.path.isdir(path)]
         _print("Removing the following testers:", *to_remove, sep="\t\n")
         self.remove(additional=to_remove)
 
 
-class DataManager:
-    def __init__(self, args):
-        self.args = args
+class DataManager(_Manager):
+    """
+    Manager for data entries
+    """
 
-    def install(self):
+    def install(self) -> None:
+        """
+        Install a data entry
+        """
         skeleton = _schema_skeleton()
 
         installed_volumes = skeleton["definitions"]["data_volumes"]["items"]["enum"]
@@ -194,7 +256,7 @@ class DataManager:
 
         try:
             docker.from_env().volumes.get(name)
-        except docker.errors.NotFound:
+        except docker_errors.NotFound:
             _print(f"No volume named {name} exists, please create it and try again", file=sys.stderr, flush=True)
             return
 
@@ -202,7 +264,11 @@ class DataManager:
         redis_connection().sadd("autotest:data_volumes", name)
         redis_connection().set("autotest:schema", json.dumps(skeleton))
 
-    def remove(self, additional=tuple()):
+    def remove(self, additional: Sequence = tuple()) -> None:
+        """
+        Removes installed data entries specified in self.args. Additional entries to remove can be specified
+        with the additional keyword
+        """
         skeleton = _schema_skeleton()
         installed_volumes = skeleton["definitions"]["data_volumes"]["items"]["enum"]
         for name in self.args.names + additional:
@@ -210,22 +276,36 @@ class DataManager:
             redis_connection().srem("autotest:data_volumes", name)
         redis_connection().set("autotest:schema", json.dumps(skeleton))
 
-    def list(self):
+    @staticmethod
+    def list() -> None:
+        """
+        Print the name and path of all installed entries
+        """
         print(*redis_connection().smembers("autotest:data_volumes"), sep="\n")
 
-    def clean(self):
+    def clean(self) -> None:
+        """
+        Remove all data entries that are installed but whose data has been removed from disk
+        """
         all_volumes = {v.name for v in docker.from_env().volumes.list()}
         to_remove = [name for name in redis_connection().smembers("autotest:data_volumes") if name not in all_volumes]
         _print("Removing the following testers:", *to_remove, sep="\t\n")
         self.remove(additional=to_remove)
 
 
-class BackendManager:
-    def install(self):
+class BackendManager(_Manager):
+    """
+    Manager for the autotest backend
+    """
+
+    @staticmethod
+    def install() -> None:
+        """
+        Check that the backend can connect to the docker engine.
+        """
         _print("checking docker connection")
         docker.from_env().ping()
 
 
 if __name__ == "__main__":
-    MANAGER, ARGS = parse_args()
-    getattr(MANAGER(ARGS), ARGS.action)()
+    parse_args()()

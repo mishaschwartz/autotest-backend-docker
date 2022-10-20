@@ -1,3 +1,4 @@
+""" Autotest Backend: docker version """
 import gzip
 import mimetypes
 import os
@@ -12,17 +13,29 @@ import docker
 import redis
 
 import concurrent.futures
+
 from contextlib import contextmanager
-from typing import Optional, Dict, Type, Tuple, List
+from typing import Optional, Dict, Type, Tuple, List, Iterable, Union
+from dateutil.parser import isoparse
+
+from docker import errors as docker_errors
+from docker.models.images import Image
+from docker.models.networks import Network
+from docker.models.volumes import Volume
+from docker.models.containers import Container
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_REGISTRY_HOST = os.path.join(_, "/") if (_ := os.environ.get("REGISTRY_HOST")) else ""
+_REGISTRY_HOST = os.environ.get("REGISTRY_HOST", "")
 _DOWNLOAD_IMAGE_NAME = "autotest-file-download"
 _ENTRYPOINT_IMAGE_NAME = "autotest-entrypoint"
 _TESTERS_DIR = os.environ.get("TESTERS_DIR", os.path.join(_THIS_DIR, "testers"))
 
 
 def redis_connection(url: Optional[str] = os.environ.get("REDIS_URL"), **kwargs: Dict) -> redis.Redis:
+    """
+    Return a connection to a redis database determined by the "redis_url"
+    configuration option.
+    """
     kwargs = {"decode_responses": True, **kwargs}
     return redis.Redis.from_url(url, **kwargs) if url else redis.Redis(**kwargs)
 
@@ -58,20 +71,30 @@ def loads_partial_json(json_string: str, expected_type: Optional[Type] = None) -
     return results, malformed
 
 
-def full_image_tag(local_tag):
-    return f"{_REGISTRY_HOST}{local_tag}"
+def full_image_tag(local_tag: str) -> str:
+    """
+    Return the local_tag prepended with the registry host if the REGISTRY_HOST
+    environment variable is set.
+    """
+    return f"{_REGISTRY_HOST.rstrip('/')}/{local_tag}" if _REGISTRY_HOST else local_tag
 
 
-def _find_or_create_image(docker_client, image_name, path=_THIS_DIR, **kwargs):
+def _find_or_create_image(
+    docker_client: docker.DockerClient, image_name: str, path: str = _THIS_DIR, **kwargs
+) -> Image:
+    """
+    Return an image with name image_name if it exists, otherwise create it first
+    based on kwargs and then return it.
+    """
     tag = full_image_tag(image_name)
     try:
         return docker_client.images.get(tag)
-    except docker.errors.ImageNotFound:
+    except docker_errors.ImageNotFound:
         pass
     if _REGISTRY_HOST:
         try:
             return docker_client.images.pull(tag)
-        except docker.errors.NotFound:
+        except docker_errors.NotFound:
             pass
     image = docker_client.images.build(path=path, tag=tag, rm=True, **kwargs)
     if _REGISTRY_HOST:
@@ -79,21 +102,36 @@ def _find_or_create_image(docker_client, image_name, path=_THIS_DIR, **kwargs):
     return image
 
 
-def file_download_image(docker_client):
+def file_download_image(docker_client: docker.DockerClient) -> Image:
+    """
+    Return an image used to download test files from a client's API.
+    """
     return _find_or_create_image(docker_client, _DOWNLOAD_IMAGE_NAME, dockerfile="file_download.Dockerfile")
 
 
-def entrypoint_image(docker_client):
+def entrypoint_image(docker_client: docker.DockerClient) -> Image:
+    """
+    Return an image containing the entrypoint script used by all tester images.
+    """
     return _find_or_create_image(docker_client, _ENTRYPOINT_IMAGE_NAME, dockerfile="entrypoint.Dockerfile")
 
 
-def plugin_image(docker_client, name, path):
+def plugin_image(docker_client: docker.DockerClient, name: str, path: str) -> Image:
+    """
+    Return an image for a plugin found at path.
+    """
     return _find_or_create_image(docker_client, name, path=path)
 
 
-def download_files_to_volume(docker_client, file_url, credentials, volume_name):
+def download_files_to_volume(
+    docker_client: docker.DockerClient, file_url: str, credentials: Dict[str, str], volume_name: str
+) -> None:
+    """
+    Downloads files from the file_url using the credentials in credentials and stores the
+    unzipped files to a volume named volume_name.
+    """
     download_image = file_download_image(docker_client)
-    docker.containers.run(
+    docker_client.containers.run(
         download_image,
         remove=True,
         auto_remove=True,
@@ -103,7 +141,11 @@ def download_files_to_volume(docker_client, file_url, credentials, volume_name):
 
 
 @contextmanager
-def tmp_network(docker_client, *args, **kwargs):
+def tmp_network(docker_client: docker.DockerClient, *args, **kwargs) -> Iterable[Network]:
+    """
+    Yields a docker network created by passing args and kwargs to docker_client.network.create
+    and removes the network when the context is exited.
+    """
     network = docker_client.network.create(*args, **kwargs)
     try:
         yield network
@@ -113,12 +155,16 @@ def tmp_network(docker_client, *args, **kwargs):
 
 @contextmanager
 def tmp_volume(
-    docker_client,
+    docker_client: docker.DockerClient,
     *args,
-    driver=os.environ.get("VOLUME_DRIVER", "local"),
-    driver_opts=json.loads(os.environ.get("VOLUME_DRIVER_OPTS", "").strip() or "{}"),
+    driver: str = os.environ.get("VOLUME_DRIVER", "local"),
+    driver_opts: Dict = json.loads(os.environ.get("VOLUME_DRIVER_OPTS", "").strip() or "{}"),
     **kwargs,
-):
+) -> Iterable[Volume]:
+    """
+    Yields a docker volume created by passing args and kwargs to docker_client.volumes.create
+    and removes the volume when the context is exited.
+    """
     volume = docker_client.volumes.create(*args, driver=driver, driver_opts=driver_opts, **kwargs)
     try:
         yield volume
@@ -126,19 +172,32 @@ def tmp_volume(
         volume.remove()
 
 
-def remove_all_containers(docker_client, container_suffixes, **kwargs):
+def remove_all_containers(docker_client: docker.DockerClient, container_suffixes: List[str], **kwargs) -> None:
+    """
+    Remove all containers whose name contains one of the strings in container_suffixes. kwargs are passed to the
+    `Container.remove` method.
+
+    This is used to clean up all containers created by running a test in case they haven't already be removed.
+    """
     for suffix in container_suffixes:
         for container in docker_client.containers.list(all=True, filters={"name": suffix}):
             container.remove(**kwargs)
 
 
-def get_feedback(container, test_data, test_id):
+def get_feedback(container: Container, test_data: Dict, test_id: Union[str, int]) -> List[Dict]:
+    """
+    Copy all feedback files specified in test_data out of container and save their content to the
+    redis database.
+
+    Return a list of dictionaries, each containing information about the content of each feedback
+    file and how to retrieve its content later from the redis database.
+    """
     feedback = []
     for file_path in test_data.get("feedback_file_names", []):
         abs_path = os.path.join("/workspace", file_path)
         try:
             file_data = container.get_archive(abs_path)
-        except docker.errors.NotFound:
+        except docker_errors.NotFound:
             raise Exception(f"Cannot find feedback file at '{file_path}'.")
         conn = redis_connection()
         id_ = conn.incr("autotest:feedback_files_id")
@@ -161,14 +220,18 @@ def get_feedback(container, test_data, test_id):
     return feedback
 
 
-def get_result(container, test_data, test_id, dateutil=None):
+def get_result(container: Container, test_data: Dict, test_id: Union[str, int]) -> Dict:
+    """
+    Return a dictionary containing the results of running the tests in container.
+    Also copies any feedback files to the redis database.
+    """
     stdout = container.logs(stderr=False, stdout=True)
     stderr = container.logs(stderr=True, stdout=False).strip()
     all_results, malformed = loads_partial_json(stdout, dict)
 
     state = container.client.api.inspect_container(container.name)["State"]
-    start_time = dateutil.parser.isoparse(state["StartedAt"])
-    end_time = dateutil.parser.isoparse(state["FinishedAt"])
+    start_time = isoparse(state["StartedAt"])
+    end_time = isoparse(state["FinishedAt"])
     run_time = (end_time - start_time).total_seconds()
 
     result = {
@@ -191,7 +254,15 @@ def get_result(container, test_data, test_id, dateutil=None):
     return result
 
 
-def create_plugin_containers(docker_client, plugin_data, network, id_suffix):
+def create_plugin_containers(
+    docker_client: docker.DockerClient, plugin_data: Dict, network: Network, id_suffix: str
+) -> Tuple[List[Container], Dict[str, str]]:
+    """
+    Create all plugin containers specified by plugin_data in the specified network and return a list of those
+    containers and a dictionary of environment variables to be used to run the tester container.
+
+    The environment variables are used to specify how the plugin containers should be accessed/used.
+    """
     environment = {}
     plugin_containers = []
     for name, data in plugin_data.items():
@@ -215,16 +286,27 @@ def create_plugin_containers(docker_client, plugin_data, network, id_suffix):
 
 
 def exec_test(
-    test_data,
-    image_name,
-    id_suffix,
-    script_volume_name,
-    files_volume_name,
-    test_env_vars,
-    plugin_data,
-    volume_data,
-    docker_client,
-):
+    test_data: Dict,
+    image_name: str,
+    id_suffix: str,
+    script_volume_name: str,
+    files_volume_name: str,
+    test_env_vars: Dict[str, str],
+    plugin_data: Dict,
+    volume_data: List[str],
+    docker_client: docker.DockerClient,
+) -> Tuple[Container, ...]:
+    """
+    Create all containers required to run the test as specified by the test_data and plugin_data. The tester
+    container is created from the image with tag image_name.
+
+    Use the id_suffix to name all networks all containers so that they can be identified later for removal.
+
+    Mount all volumes specified by the script_volume_name, files_volume_name, and volume_data to the
+    tester container.
+
+    Return all containers created.
+    """
     container_name = f"autotest-container-test-{id_suffix}"
     with tmp_network(docker_client, f"autotest-network-{id_suffix}") as network:
         plugin_containers, plugin_environment = create_plugin_containers(docker_client, plugin_data, network, id_suffix)
@@ -247,7 +329,24 @@ def exec_test(
     return container, *plugin_containers
 
 
-def run_test(settings_id, test_id, files_url, categories, user, test_env_vars):
+def run_test(
+    settings_id: Union[str, int],
+    test_id: Union[str, int],
+    files_url: str,
+    categories: List[str],
+    user: str,
+    test_env_vars: Dict[str, str],
+) -> None:
+    """
+    Run all tests by downloading the files at files_url and running the tests specified by the settings with id
+    settings_id against those files. Only run tests that share a category with categories.
+
+    Store the results of the test in the redis database using the test_id to identify the results.
+
+    The user argument is used to retrieve credentials necessary to authorize the download of the files at files_url.
+
+    The test_env_vars are additional environment variables to be passed to the process running the tests.
+    """
     results = []
     error = None
     try:
@@ -304,7 +403,18 @@ def run_test(settings_id, test_id, files_url, categories, user, test_env_vars):
         redis_connection().expire(key, 3600)  # TODO: make this configurable
 
 
-def update_test_settings(user, settings_id, test_settings, file_url):
+def update_test_settings(user: str, settings_id: Union[str, int], test_settings: Dict, file_url: str) -> None:
+    """
+    Create images and volumes that will be used later to run tests.
+
+    An image is created for each tester specified in the test_settings and a volume is created
+    containing the files downloaded from file_url.
+
+    Information about the image and volume are stored to the redis database using the settings_id to
+    identify the settings.
+
+    The user argument is used to retrieve credentials necessary to authorize the download of the files at file_url.
+    """
     try:
         creds = json.loads(redis_connection().hget("autotest:user_credentials", key=user))
         docker_client = docker.from_env()
@@ -313,7 +423,7 @@ def update_test_settings(user, settings_id, test_settings, file_url):
         try:
             old_volume = docker_client.volumes.get(script_volume_name)
             old_volume.remove(force=True)  # TODO: don't remove if in use
-        except docker.errors.NotFound:
+        except docker_errors.NotFound:
             pass
         docker_client.volumes.create(name=script_volume_name)
         download_files_to_volume(docker_client, file_url, creds, script_volume_name)

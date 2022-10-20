@@ -1,3 +1,4 @@
+""" Settings used to initialize rq workers """
 import os
 
 queues = os.environ.get("QUEUES", "high low batch").strip().split()
