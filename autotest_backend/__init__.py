@@ -273,7 +273,7 @@ def create_plugin_containers(
             cli = os.path.join(path, "docker.cli")
             stringified_data = {k: str(v) for k, v in data.items() if k != "enabled"}
             proc = subprocess.run(
-                [cli, "before_test"], capture_output=True, check=False, universal_newlines=True, env=stringified_data
+                [cli, "before_test"], capture_output=True, universal_newlines=True, env=stringified_data
             )
             environment.update(json.loads(proc.stdout))
             plugin_image_tag = plugin_image(docker_client, name, path).tags[0]
@@ -369,7 +369,7 @@ def run_test(
                     for i, tester_settings in enumerate(settings["testers"]):
                         for j, test_data in enumerate(tester_settings["test_data"]):
                             plugin_data = test_data.get("plugins", {})
-                            volume_data = test_data.get("data_volumes", [])
+                            volume_data = test_data.get("data_entries", [])
                             if set(test_data["category"]) & set(categories):
                                 id_suffix = f"{settings_id}-{test_id}-{i}-{j}"
                                 container_suffixes.append(id_suffix)
