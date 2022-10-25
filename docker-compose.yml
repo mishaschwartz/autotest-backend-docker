@@ -1,7 +1,7 @@
 version: '3.7'
 
 services:
-  server:
+  backend-dev:
     build:
       target: dev
     image: autotest-backend-docker-dev:1.0.0
@@ -9,21 +9,22 @@ services:
       - .:/app
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
-      - REDIS_URL=redis://redis:6379/
-      - REGISTRY_HOST=localhost:5001 # optional: use if you want to store images to a custom registry
-      - VOLUME_DRIVER=local
-      - VOLUME_DRIVER_OPTS={} # opts are json string
-    depends_on:
-      - redis
+      - REDIS_URL=redis://localhost:6379/ # This value is required and should be set to point to your redis database
+      - REGISTRY_URL=localhost:5001 # optional: use if you want to store images to a custom registry (see below)
     deploy:
       replicas: 2
 
-  redis: # TODO: only have one redis container for the api and the backend
-    image: redis:7.0.4-alpine
+  backend-prod:
+    build:
+      target: prod
+    image: autotest-backend-docker:1.0.0
     volumes:
-      - redis_autotest:/data
-    ports:
-    - 6379
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - REDIS_URL=redis://localhost:6379/ # This value is required and should be set to point to your redis database
+      - REGISTRY_URL=localhost:5001 # optional: use if you want to store images to a custom registry (see below)
+    deploy:
+      replicas: 2
 
   registry:
     image: registry:2.8.1
@@ -33,8 +34,3 @@ services:
       - registry:/var/lib/registry
     ports:
       - '5001:5001'
-
-volumes:
-  postgres_autotest:
-  redis_autotest:
-  workspace:

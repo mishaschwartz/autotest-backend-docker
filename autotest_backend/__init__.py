@@ -25,10 +25,9 @@ from docker.models.volumes import Volume
 from docker.models.containers import Container
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_REGISTRY_HOST = os.environ.get("REGISTRY_HOST", "")
+_REGISTRY_URL = os.environ.get("REGISTRY_URL", "")
 _DOWNLOAD_IMAGE_NAME = "autotest-file-download"
 _ENTRYPOINT_IMAGE_NAME = "autotest-entrypoint"
-_TESTERS_DIR = os.environ.get("TESTERS_DIR", os.path.join(_THIS_DIR, "testers"))
 
 
 def redis_connection(url: Optional[str] = os.environ.get("REDIS_URL"), **kwargs: Dict) -> redis.Redis:
@@ -73,10 +72,10 @@ def loads_partial_json(json_string: str, expected_type: Optional[Type] = None) -
 
 def full_image_tag(local_tag: str) -> str:
     """
-    Return the local_tag prepended with the registry host if the REGISTRY_HOST
+    Return the local_tag prepended with the registry host if the REGISTRY_URL
     environment variable is set.
     """
-    return f"{_REGISTRY_HOST.rstrip('/')}/{local_tag}" if _REGISTRY_HOST else local_tag
+    return f"{_REGISTRY_URL.rstrip('/')}/{local_tag}" if _REGISTRY_URL else local_tag
 
 
 def _find_or_create_image(
@@ -91,13 +90,13 @@ def _find_or_create_image(
         return docker_client.images.get(tag)
     except docker_errors.ImageNotFound:
         pass
-    if _REGISTRY_HOST:
+    if _REGISTRY_URL:
         try:
             return docker_client.images.pull(tag)
         except docker_errors.NotFound:
             pass
     image = docker_client.images.build(path=path, tag=tag, rm=True, **kwargs)
-    if _REGISTRY_HOST:
+    if _REGISTRY_URL:
         docker_client.images.push(tag)
     return image
 
@@ -435,13 +434,14 @@ def update_test_settings(user: str, settings_id: Union[str, int], test_settings:
             tester_type = tester_settings["tester_type"]
             env_data = tester_settings.get("env_data", {})
             tag = full_image_tag(f"tester:{settings_id}.{i}")
-            with open(os.path.join(_TESTERS_DIR, tester_type, "Dockerfile")) as f:
+            tester_path = redis_connection().get(f"autotest:tester:{tester_type}")
+            with open(os.path.join(tester_path, "Dockerfile")) as f:
                 dockerfile_buffer = io.StringIO()
                 dockerfile_buffer.write(
                     f"{f.read()}\nCOPY --from={entrypoint_tag} --chmod=0744 /entrypoint.sh /entrypoint.sh\n"
                 )
                 tester_image, _ = docker_client.images.build(
-                    path=os.path.join(_TESTERS_DIR, tester_type),
+                    path=tester_path,
                     fileobj=dockerfile_buffer,
                     tag=tag,
                     rm=True,
@@ -450,7 +450,7 @@ def update_test_settings(user: str, settings_id: Union[str, int], test_settings:
                         "REQUIREMENTS": env_data.get("requirements"),
                     },
                 )
-            if _REGISTRY_HOST:
+            if _REGISTRY_URL:
                 docker_client.images.push(tag)
             tester_settings["_image"] = tester_image.tags[0]
             test_settings.pop("_error", None)
