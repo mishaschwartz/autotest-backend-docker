@@ -11,6 +11,7 @@ import subprocess
 
 import docker
 import redis
+import rq
 
 import concurrent.futures
 
@@ -30,13 +31,11 @@ _DOWNLOAD_IMAGE_NAME = "autotest-file-download"
 _ENTRYPOINT_IMAGE_NAME = "autotest-entrypoint"
 
 
-def redis_connection(url: Optional[str] = os.environ.get("REDIS_URL"), **kwargs: Dict) -> redis.Redis:
+def redis_connection() -> redis.Redis:
     """
-    Return a connection to a redis database determined by the "redis_url"
-    configuration option.
+    Return a connection to a redis database.
     """
-    kwargs = {"decode_responses": True, **kwargs}
-    return redis.Redis.from_url(url, **kwargs) if url else redis.Redis(**kwargs)
+    return rq.get_current_job().connection
 
 
 def loads_partial_json(json_string: str, expected_type: Optional[Type] = None) -> Tuple[List, bool]:
@@ -269,6 +268,7 @@ def create_plugin_containers(
             path = redis_connection().get(f"autotest:plugin:{name}")
             if path is None:
                 raise Exception(f"plugin {name} is not installed")
+            path = path.decode()
             cli = os.path.join(path, "docker.cli")
             stringified_data = {k: str(v) for k, v in data.items() if k != "enabled"}
             proc = subprocess.run(
@@ -435,6 +435,9 @@ def update_test_settings(user: str, settings_id: Union[str, int], test_settings:
             env_data = tester_settings.get("env_data", {})
             tag = full_image_tag(f"tester:{settings_id}.{i}")
             tester_path = redis_connection().get(f"autotest:tester:{tester_type}")
+            if tester_path is None:
+                raise Exception(f"tester {tester_type} is not installed.")
+            tester_path = tester_path.decode()
             with open(os.path.join(tester_path, "Dockerfile")) as f:
                 dockerfile_buffer = io.StringIO()
                 dockerfile_buffer.write(

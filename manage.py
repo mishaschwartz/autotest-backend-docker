@@ -10,9 +10,12 @@ import json
 import subprocess
 import argparse
 import docker
-from autotest_backend import redis_connection, plugin_image
+import redis
+from autotest_backend import plugin_image
 from typing import Dict, Callable, Sequence, Iterable, Tuple
 from docker import errors as docker_errors
+
+REDIS_CONNECTION = redis.Redis.from_url(os.environ.get("REDIS_URL"), decode_responses=True)
 
 
 def _schema() -> Dict:
@@ -20,7 +23,7 @@ def _schema() -> Dict:
     Return a dictionary representation of the json loaded from the schema_skeleton.json file or from the redis
     database if it exists.
     """
-    schema = redis_connection().get("autotest:schema")
+    schema = REDIS_CONNECTION.get("autotest:schema")
 
     if schema:
         return json.loads(schema)
@@ -119,8 +122,8 @@ class PluginManager(_Manager):
                     continue
                 plugin_image(docker_client, plugin_name, path)
                 installed_plugins.update(settings)
-                redis_connection().set(f"autotest:plugin:{plugin_name}", path)
-        redis_connection().set("autotest:schema", json.dumps(schema))
+                REDIS_CONNECTION.set(f"autotest:plugin:{plugin_name}", path)
+        REDIS_CONNECTION.set("autotest:schema", json.dumps(schema))
 
     def remove(self, additional: Sequence = tuple()) -> None:
         """
@@ -130,23 +133,23 @@ class PluginManager(_Manager):
 
         installed_plugins = schema["definitions"]["plugins"]["properties"]
         for name in self.args.names + additional:
-            redis_connection().delete(f"autotest:plugin:{name}")
+            REDIS_CONNECTION.delete(f"autotest:plugin:{name}")
             if name in installed_plugins:
                 installed_plugins.remove(name)
             try:
                 installed_plugins.pop(name)
             except KeyError:
                 continue
-        redis_connection().set("autotest:schema", json.dumps(schema))
+        REDIS_CONNECTION.set("autotest:schema", json.dumps(schema))
 
     @staticmethod
     def _get_installed() -> Iterable[Tuple[str, str]]:
         """
         Yield the name and path of all installed plugins
         """
-        for plugin_key in redis_connection().keys("autotest:tuple:*"):
+        for plugin_key in REDIS_CONNECTION.keys("autotest:tuple:*"):
             plugin_name = plugin_key.split(":")[-1]
-            path = redis_connection().get(plugin_key)
+            path = REDIS_CONNECTION.get(plugin_key)
             yield plugin_name, path
 
     def list(self) -> None:
@@ -194,8 +197,8 @@ class TesterManager(_Manager):
                     continue
                 installed_testers.append(tester_name)
                 schema["definitions"]["tester_schemas"]["oneOf"].append(settings)
-                redis_connection().set(f"autotest:tester:{tester_name}", path)
-        redis_connection().set("autotest:schema", json.dumps(schema))
+                REDIS_CONNECTION.set(f"autotest:tester:{tester_name}", path)
+        REDIS_CONNECTION.set("autotest:schema", json.dumps(schema))
 
     def remove(self, additional: Sequence = tuple()) -> None:
         """
@@ -207,23 +210,23 @@ class TesterManager(_Manager):
         tester_settings = schema["definitions"]["tester_schemas"]["oneOf"]
         installed_testers = schema["definitions"]["installed_testers"]["enum"]
         for name in self.args.names + additional:
-            redis_connection().delete(f"autotest:tester:{name}")
+            REDIS_CONNECTION.delete(f"autotest:tester:{name}")
             if name in installed_testers:
                 installed_testers.remove(name)
             for i, settings in enumerate(tester_settings):
                 if name in settings["properties"]["tester_type"]["enum"]:
                     tester_settings.pop(i)
                     break
-        redis_connection().set("autotest:schema", json.dumps(schema))
+        REDIS_CONNECTION.set("autotest:schema", json.dumps(schema))
 
     @staticmethod
     def _get_installed() -> Iterable[Tuple[str, str]]:
         """
         Yield the name and path of all installed testers
         """
-        for tester_key in redis_connection().keys("autotest:tester:*"):
+        for tester_key in REDIS_CONNECTION.keys("autotest:tester:*"):
             tester_name = tester_key.split(":")[-1]
-            path = redis_connection().get(tester_key)
+            path = REDIS_CONNECTION.get(tester_key)
             yield tester_name, path
 
     def list(self) -> None:
@@ -267,8 +270,8 @@ class DataManager(_Manager):
             return
 
         installed_volumes.append(name)
-        redis_connection().sadd("autotest:data_entries", name)
-        redis_connection().set("autotest:schema", json.dumps(schema))
+        REDIS_CONNECTION.sadd("autotest:data_entries", name)
+        REDIS_CONNECTION.set("autotest:schema", json.dumps(schema))
 
     def remove(self, additional: Sequence = tuple()) -> None:
         """
@@ -279,22 +282,22 @@ class DataManager(_Manager):
         installed_volumes = schema["definitions"]["data_entries"]["items"]["enum"]
         for name in self.args.names + additional:
             installed_volumes.remove(name)
-            redis_connection().srem("autotest:data_entries", name)
-        redis_connection().set("autotest:schema", json.dumps(schema))
+            REDIS_CONNECTION.srem("autotest:data_entries", name)
+        REDIS_CONNECTION.set("autotest:schema", json.dumps(schema))
 
     @staticmethod
     def list() -> None:
         """
         Print the name and path of all installed entries
         """
-        print(*redis_connection().smembers("autotest:data_entries"), sep="\n")
+        print(*REDIS_CONNECTION.smembers("autotest:data_entries"), sep="\n")
 
     def clean(self) -> None:
         """
         Remove all data entries that are installed but whose data has been removed from disk
         """
         all_volumes = {v.name for v in docker.from_env().volumes.list()}
-        to_remove = [name for name in redis_connection().smembers("autotest:data_entries") if name not in all_volumes]
+        to_remove = [name for name in REDIS_CONNECTION.smembers("autotest:data_entries") if name not in all_volumes]
         _print("Removing the following data entries:", *to_remove, sep="\t\n")
         self.remove(additional=to_remove)
 
@@ -311,7 +314,7 @@ class BackendManager(_Manager):
         """
         _print("checking docker connection")
         docker.from_env().ping()
-        redis_connection().set("autotest:schema", json.dumps(_schema()))
+        REDIS_CONNECTION.set("autotest:schema", json.dumps(_schema()))
 
 
 if __name__ == "__main__":
