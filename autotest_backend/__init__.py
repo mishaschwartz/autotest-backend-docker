@@ -4,13 +4,13 @@ import mimetypes
 import os
 import io
 import json
-import signal
 import tarfile
 import time
 import subprocess
 
 import docker
 import redis
+import requests.exceptions
 import rq
 
 import concurrent.futures
@@ -24,12 +24,11 @@ from docker.models.images import Image
 from docker.models.networks import Network
 from docker.models.volumes import Volume
 from docker.models.containers import Container
+from docker.errors import APIError as DockerApiError
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _REGISTRY_URL = os.environ.get("REGISTRY_URL", "")
 _DOWNLOAD_IMAGE_NAME = "autotest-file-download"
-_ENTRYPOINT_IMAGE_NAME = "autotest-entrypoint"
-
 
 def redis_connection() -> redis.Redis:
     """
@@ -94,7 +93,7 @@ def _find_or_create_image(
             return docker_client.images.pull(tag)
         except docker_errors.NotFound:
             pass
-    image = docker_client.images.build(path=path, tag=tag, rm=True, **kwargs)
+    image, _logs = docker_client.images.build(path=path, tag=tag, rm=True, **kwargs)
     if _REGISTRY_URL:
         docker_client.images.push(tag)
     return image
@@ -105,13 +104,6 @@ def file_download_image(docker_client: docker.DockerClient) -> Image:
     Return an image used to download test files from a client's API.
     """
     return _find_or_create_image(docker_client, _DOWNLOAD_IMAGE_NAME, dockerfile="file_download.Dockerfile")
-
-
-def entrypoint_image(docker_client: docker.DockerClient) -> Image:
-    """
-    Return an image containing the entrypoint script used by all tester images.
-    """
-    return _find_or_create_image(docker_client, _ENTRYPOINT_IMAGE_NAME, dockerfile="entrypoint.Dockerfile")
 
 
 def plugin_image(docker_client: docker.DockerClient, name: str, path: str) -> Image:
@@ -132,7 +124,6 @@ def download_files_to_volume(
     docker_client.containers.run(
         download_image,
         remove=True,
-        auto_remove=True,
         volumes=[f"{volume_name}:/files"],
         environment={"URL": file_url, "AUTH_TYPE": credentials["auth_type"], "CREDENTIALS": credentials["credentials"]},
     )
@@ -141,13 +132,15 @@ def download_files_to_volume(
 @contextmanager
 def tmp_network(docker_client: docker.DockerClient, *args, **kwargs) -> Iterable[Network]:
     """
-    Yields a docker network created by passing args and kwargs to docker_client.network.create
+    Yields a docker network created by passing args and kwargs to docker_client.networks.create
     and removes the network when the context is exited.
     """
-    network = docker_client.network.create(*args, **kwargs)
+    network = docker_client.networks.create(*args, **kwargs)
     try:
         yield network
     finally:
+        for container in network.containers:
+            network.disconnect(container, force=True)
         network.remove()
 
 
@@ -223,14 +216,14 @@ def get_result(container: Container, test_data: Dict, test_id: Union[str, int]) 
     Return a dictionary containing the results of running the tests in container.
     Also copies any feedback files to the redis database.
     """
-    stdout = container.logs(stderr=False, stdout=True)
-    stderr = container.logs(stderr=True, stdout=False).strip()
+    stdout = container.logs(stderr=False, stdout=True).decode()
+    stderr = container.logs(stderr=True, stdout=False).strip().decode()
     all_results, malformed = loads_partial_json(stdout, dict)
 
     state = container.client.api.inspect_container(container.name)["State"]
     start_time = isoparse(state["StartedAt"])
     end_time = isoparse(state["FinishedAt"])
-    run_time = (end_time - start_time).total_seconds()
+    run_time = int((end_time - start_time).total_seconds() * 1000)
 
     result = {
         "time": run_time,
@@ -293,6 +286,7 @@ def exec_test(
     test_env_vars: Dict[str, str],
     plugin_data: Dict,
     volume_data: List[str],
+    timeout: Optional[int],
     docker_client: docker.DockerClient,
 ) -> Tuple[Container, ...]:
     """
@@ -315,16 +309,23 @@ def exec_test(
         container = docker_client.containers.run(
             image_name,
             detach=True,
-            network=network,
+            network=network.name,
             environment=environment,
             name=container_name,
-            stop_signal=signal.SIGUSR1,
             volumes=volumes,
-            command=json.dumps(test_data),
+            command=[json.dumps(test_data)],
             entrypoint=["/entrypoint.sh"],
         )
 
-        container.stop(timeout=test_data["timeout"])
+        try:
+            container.wait(timeout=timeout)
+        except requests.exceptions.ReadTimeout:
+            pass  # timeout is reached
+        for container_ in [container, *plugin_containers]:
+            try:
+                container_.kill()
+            except DockerApiError:
+                pass  # container_ is already dead
     return container, *plugin_containers
 
 
@@ -375,7 +376,7 @@ def run_test(
                                 image_name = tester_settings["_image"]
                                 future = executor.submit(
                                     exec_test,
-                                    test_data,
+                                    {"test_data": test_data},
                                     image_name,
                                     id_suffix,
                                     script_volume_name,
@@ -383,6 +384,7 @@ def run_test(
                                     test_env_vars,
                                     plugin_data,
                                     volume_data,
+                                    test_data["timeout"],
                                     docker_client,
                                 )
                                 futures[future] = (test_data, id_suffix)
@@ -390,12 +392,11 @@ def run_test(
                         tester_container, *supporting_containers = future.result()
                         test_data, id_suffix = futures[future]
                         results.append(get_result(tester_container, test_data, test_id))
-                        for container in supporting_containers:
-                            container.kill()
             finally:
                 remove_all_containers(docker_client, container_suffixes, force=True)
     except Exception as e:
-        error = str(e)
+        import traceback
+        error = traceback.format_exc()
     finally:
         key = f"autotest:test_result:{test_id}"
         redis_connection().set(key, json.dumps({"test_groups": results, "error": error}))
@@ -428,31 +429,23 @@ def update_test_settings(user: str, settings_id: Union[str, int], test_settings:
         download_files_to_volume(docker_client, file_url, creds, script_volume_name)
         test_settings["_scripts_volume"] = script_volume_name
 
-        entrypoint_tag = entrypoint_image(docker_client).tags[0]
-
         for i, tester_settings in enumerate(test_settings["testers"]):
             tester_type = tester_settings["tester_type"]
             env_data = tester_settings.get("env_data", {})
-            tag = full_image_tag(f"tester:{settings_id}.{i}")
+            tag = full_image_tag(f"autotest-tester:{settings_id}.{i}")
             tester_path = redis_connection().get(f"autotest:tester:{tester_type}")
             if tester_path is None:
                 raise Exception(f"tester {tester_type} is not installed.")
             tester_path = tester_path.decode()
-            with open(os.path.join(tester_path, "Dockerfile")) as f:
-                dockerfile_buffer = io.StringIO()
-                dockerfile_buffer.write(
-                    f"{f.read()}\nCOPY --from={entrypoint_tag} --chmod=0744 /entrypoint.sh /entrypoint.sh\n"
-                )
-                tester_image, _ = docker_client.images.build(
-                    path=tester_path,
-                    fileobj=dockerfile_buffer,
-                    tag=tag,
-                    rm=True,
-                    build_args={
-                        "VERSION": env_data.get("version"),
-                        "REQUIREMENTS": env_data.get("requirements"),
-                    },
-                )
+            tester_image, _ = docker_client.images.build(
+                path=tester_path,
+                tag=tag,
+                rm=True,
+                buildargs={
+                    "VERSION": str(env_data.get("version")),
+                    "REQUIREMENTS": env_data.get("requirements"),
+                },
+            )
             if _REGISTRY_URL:
                 docker_client.images.push(tag)
             tester_settings["_image"] = tester_image.tags[0]

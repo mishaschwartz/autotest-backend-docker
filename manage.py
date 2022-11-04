@@ -132,7 +132,7 @@ class PluginManager(_Manager):
         schema = _schema()
 
         installed_plugins = schema["definitions"]["plugins"]["properties"]
-        for name in self.args.names + additional:
+        for name in self.args.names + list(additional):
             REDIS_CONNECTION.delete(f"autotest:plugin:{name}")
             if name in installed_plugins:
                 installed_plugins.remove(name)
@@ -209,7 +209,7 @@ class TesterManager(_Manager):
 
         tester_settings = schema["definitions"]["tester_schemas"]["oneOf"]
         installed_testers = schema["definitions"]["installed_testers"]["enum"]
-        for name in self.args.names + additional:
+        for name in self.args.names + list(additional):
             REDIS_CONNECTION.delete(f"autotest:tester:{name}")
             if name in installed_testers:
                 installed_testers.remove(name)
@@ -280,7 +280,7 @@ class DataManager(_Manager):
         """
         schema = _schema()
         installed_volumes = schema["definitions"]["data_entries"]["items"]["enum"]
-        for name in self.args.names + additional:
+        for name in self.args.names + list(additional):
             installed_volumes.remove(name)
             REDIS_CONNECTION.srem("autotest:data_entries", name)
         REDIS_CONNECTION.set("autotest:schema", json.dumps(schema))
