@@ -370,7 +370,7 @@ def run_test(
                         for j, test_data in enumerate(tester_settings["test_data"]):
                             plugin_data = test_data.get("plugins", {})
                             volume_data = test_data.get("data_entries", [])
-                            if set(test_data["category"]) & set(categories):
+                            if set(test_data["categories"]) & set(categories):
                                 id_suffix = f"{settings_id}-{test_id}-{i}-{j}"
                                 container_suffixes.append(id_suffix)
                                 image_name = tester_settings["_image"]
